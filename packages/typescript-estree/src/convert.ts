@@ -25,6 +25,8 @@ import {
   getNamespaceModifiers,
   getRange,
   getTextForTokenKind,
+  getTokenEndAfter,
+  getTokenStartAfter,
   getTSNodeAccessibility,
   hasModifier,
   isChainExpression,
@@ -36,7 +38,10 @@ import {
   isThisInTypeQuery,
   unescapeStringLiteralText,
 } from './node-utils';
-import { AST_NODE_TYPES } from './ts-estree';
+import * as tsEstree from './ts-estree';
+
+// Read once: the compiled re-export is a getter, and this is used for every node.
+import AST_NODE_TYPES = tsEstree.AST_NODE_TYPES;
 
 const SyntaxKind = ts.SyntaxKind;
 
@@ -62,6 +67,91 @@ export function convertError(
   );
 }
 
+// keys we never want to clone from the base typescript node as they
+// introduce garbage into our AST
+const KEYS_TO_NOT_COPY = new Set([
+  '_children',
+  'decorators',
+  'end',
+  'flags',
+  'heritageClauses',
+  'illegalDecorators',
+  'jsDoc',
+  'kind',
+  'locals',
+  'localSymbol',
+  'modifierFlagsCache',
+  'modifiers',
+  'nextContainer',
+  'parent',
+  'pos',
+  'symbol',
+  'transformFlags',
+  'type',
+  'typeArguments',
+  'typeParameters',
+]);
+
+/**
+ * A WeakMap whose entries are recorded cheaply during conversion and only
+ * inserted the first time the map is used. Inserting into a WeakMap for every
+ * node is expensive, and most lint runs never look at the node maps.
+ */
+class LazyWeakMap<Key extends WeakKey, Value> extends WeakMap<Key, Value> {
+  readonly #keepFirst: boolean;
+  #pending: (Key | Value)[] = [];
+
+  /**
+   * @param keepFirst whether the first value recorded for a key is kept,
+   * rather than the last one
+   */
+  constructor(keepFirst: boolean) {
+    super();
+    this.#keepFirst = keepFirst;
+  }
+
+  #flush(): void {
+    const pending = this.#pending;
+    if (pending.length === 0) {
+      return;
+    }
+    this.#pending = [];
+    for (let i = 0; i < pending.length; i += 2) {
+      const key = pending[i] as Key;
+      if (!this.#keepFirst || !super.has(key)) {
+        super.set(key, pending[i + 1] as Value);
+      }
+    }
+  }
+
+  /**
+   * Records an entry without inserting it yet.
+   */
+  add(key: Key, value: Value): void {
+    this.#pending.push(key, value);
+  }
+
+  override delete(key: Key): boolean {
+    this.#flush();
+    return super.delete(key);
+  }
+
+  override get(key: Key): Value | undefined {
+    this.#flush();
+    return super.get(key);
+  }
+
+  override has(key: Key): boolean {
+    this.#flush();
+    return super.has(key);
+  }
+
+  override set(key: Key, value: Value): this {
+    this.#flush();
+    return super.set(key, value);
+  }
+}
+
 export interface ASTMaps {
   esTreeNodeToTSNodeMap: ParserWeakMapESTreeToTSNode;
   tsNodeToESTreeNodeMap: ParserWeakMap<TSNode, TSESTree.Node>;
@@ -70,9 +160,13 @@ export interface ASTMaps {
 export class Converter {
   private allowPattern = false;
   private readonly ast: ts.SourceFile;
-  private readonly esTreeNodeToTSNodeMap = new WeakMap();
+  private readonly esTreeNodeToTSNodeMap = new LazyWeakMap<any, any>(
+    /* keepFirst */ false,
+  );
   private readonly options: ConverterOptions;
-  private readonly tsNodeToESTreeNodeMap = new WeakMap();
+  private readonly tsNodeToESTreeNodeMap = new LazyWeakMap<any, any>(
+    /* keepFirst */ true,
+  );
 
   /**
    * Converts a TypeScript node into an ESTree node
@@ -376,8 +470,11 @@ export class Converter {
       return undefined;
     }
 
-    const greaterThanToken = findNextToken(typeArguments, this.ast, this.ast)!;
-    const range: TSESTree.Range = [typeArguments.pos - 1, greaterThanToken.end];
+    // the token after the type arguments is the closing `>`
+    const range: TSESTree.Range = [
+      typeArguments.pos - 1,
+      getTokenEndAfter(typeArguments.end, this.ast),
+    ];
 
     if (typeArguments.length === 0) {
       this.#throwError(range, 'Type argument list cannot be empty.');
@@ -421,10 +518,10 @@ export class Converter {
       return undefined;
     }
 
-    const greaterThanToken = findNextToken(typeParameters, this.ast, this.ast)!;
+    // the token after the type parameters is the closing `>`
     const range: TSESTree.Range = [
       typeParameters.pos - 1,
-      greaterThanToken.end,
+      getTokenEndAfter(typeParameters.end, this.ast),
     ];
 
     if (typeParameters.length === 0) {
@@ -2894,7 +2991,7 @@ export class Converter {
     result.loc ??= getLocFor(result.range, this.ast);
 
     if (result && this.options.shouldPreserveNodeMaps) {
-      this.esTreeNodeToTSNodeMap.set(result, node);
+      this.esTreeNodeToTSNodeMap.add(result, node);
     }
     return result as T;
   }
@@ -2955,31 +3052,6 @@ export class Converter {
       result.decorators = this.convertChildren(decorators);
     }
 
-    // keys we never want to clone from the base typescript node as they
-    // introduce garbage into our AST
-    const KEYS_TO_NOT_COPY = new Set([
-      '_children',
-      'decorators',
-      'end',
-      'flags',
-      'heritageClauses',
-      'illegalDecorators',
-      'jsDoc',
-      'kind',
-      'locals',
-      'localSymbol',
-      'modifierFlagsCache',
-      'modifiers',
-      'nextContainer',
-      'parent',
-      'pos',
-      'symbol',
-      'transformFlags',
-      'type',
-      'typeArguments',
-      'typeParameters',
-    ]);
-
     Object.entries<any>(node)
       .filter(([key]) => !KEYS_TO_NOT_COPY.has(key))
       .forEach(([key, value]) => {
@@ -3033,11 +3105,11 @@ export class Converter {
       const declarationIsDefault =
         nextModifier?.kind === SyntaxKind.DefaultKeyword;
 
-      const varToken = declarationIsDefault
-        ? findNextToken(nextModifier, this.ast, this.ast)
-        : findNextToken(exportKeyword, this.ast, this.ast);
-
-      result.range[0] = varToken!.getStart(this.ast);
+      // the declaration starts at the token after `export` or `default`
+      result.range[0] = getTokenStartAfter(
+        declarationIsDefault ? nextModifier.end : exportKeyword.end,
+        this.ast,
+      );
       result.loc = getLocFor(result.range, this.ast);
 
       if (declarationIsDefault) {
@@ -3089,12 +3161,9 @@ export class Converter {
     node: ts.Node,
     result: TSESTree.Node | null,
   ): void {
-    if (
-      result &&
-      this.options.shouldPreserveNodeMaps &&
-      !this.tsNodeToESTreeNodeMap.has(node)
-    ) {
-      this.tsNodeToESTreeNodeMap.set(node, result);
+    if (result && this.options.shouldPreserveNodeMaps) {
+      // the first ESTree node recorded for a TypeScript node is the one kept
+      this.tsNodeToESTreeNodeMap.add(node, result);
     }
   }
 }

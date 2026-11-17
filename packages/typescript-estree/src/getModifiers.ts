@@ -13,6 +13,11 @@ export function getModifiers(
   }
 
   if (isAtLeast48) {
+    // modifiers and decorators are both stored in `node.modifiers`
+    if ((node as Partial<ts.HasModifiers>).modifiers == null) {
+      return undefined;
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-deprecated -- this is safe as it's guarded
     if (includeIllegalModifiers || ts.canHaveModifiers(node)) {
       // eslint-disable-next-line @typescript-eslint/no-deprecated -- this is safe as it's guarded
@@ -40,6 +45,11 @@ export function getDecorators(
   }
 
   if (isAtLeast48) {
+    // modifiers and decorators are both stored in `node.modifiers`
+    if ((node as Partial<ts.HasModifiers>).modifiers == null) {
+      return undefined;
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-deprecated -- this is safe as it's guarded
     if (includeIllegalDecorators || ts.canHaveDecorators(node)) {
       // eslint-disable-next-line @typescript-eslint/no-deprecated -- this is safe as it's guarded

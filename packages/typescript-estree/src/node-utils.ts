@@ -4,8 +4,12 @@ import type { TSESTree } from './ts-estree';
 
 import { getModifiers } from './getModifiers';
 import { xhtmlEntities } from './jsx/xhtml-entities';
-import { AST_NODE_TYPES, AST_TOKEN_TYPES } from './ts-estree';
+import * as tsEstree from './ts-estree';
 import { typescriptVersionIsAtLeast } from './version-check';
+
+// Read once: the compiled re-exports are getters, and these are used for every token.
+import AST_NODE_TYPES = tsEstree.AST_NODE_TYPES;
+import AST_TOKEN_TYPES = tsEstree.AST_TOKEN_TYPES;
 
 const isAtLeast50 = typescriptVersionIsAtLeast['5.0'];
 
@@ -170,14 +174,6 @@ export function isComment(node: ts.Node): boolean {
 }
 
 /**
- * Returns true if the given ts.Node is a JSDoc comment
- */
-function isJSDocComment(node: ts.Node): node is ts.JSDoc {
-  // eslint-disable-next-line @typescript-eslint/no-deprecated -- SyntaxKind.JSDoc was only added in TS4.7 so we can't use it yet
-  return node.kind === SyntaxKind.JSDocComment;
-}
-
-/**
  * Returns the binary expression type of the given ts.Token
  */
 export function getBinaryExpressionType(operator: ts.BinaryOperatorToken):
@@ -226,10 +222,68 @@ export function getLineAndCharacterFor(
   pos: number,
   ast: ts.SourceFile,
 ): TSESTree.Position {
-  const loc = ast.getLineAndCharacterOfPosition(pos);
+  const lineStarts = ast.getLineStarts();
+  const line = findLine(lineStarts, pos, 0);
   return {
-    column: loc.character,
-    line: loc.line + 1,
+    column: pos - lineStarts[line],
+    line: line + 1,
+  };
+}
+
+/**
+ * Returns the index of the line containing `pos`: the last line that starts
+ * at or before `pos`. `from` is a line known to start at or before `pos`;
+ * the search gallops forward from it, so lookups close to `from` are cheap.
+ */
+function findLine(
+  lineStarts: readonly number[],
+  pos: number,
+  from: number,
+): number {
+  const count = lineStarts.length;
+  let low = from;
+  let step = 1;
+  let high = low + step;
+  while (high < count && lineStarts[high] <= pos) {
+    low = high;
+    step *= 2;
+    high = low + step;
+  }
+  if (high > count) {
+    high = count;
+  }
+  // lineStarts[low] <= pos, and lineStarts[high] > pos (or high === count)
+  while (low + 1 < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (lineStarts[middle] <= pos) {
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+/**
+ * Returns line and column data for the given start and end positions.
+ * @param lineHint a line index to start looking for `start` from; ignored
+ * if that line starts after `start`
+ */
+function getLocForPositions(
+  start: number,
+  end: number,
+  lineStarts: readonly number[],
+  lineHint = 0,
+): TSESTree.SourceLocation {
+  const startLine = findLine(
+    lineStarts,
+    start,
+    lineStarts[lineHint] <= start ? lineHint : 0,
+  );
+  const endLine = findLine(lineStarts, end, end >= start ? startLine : 0);
+  return {
+    end: { column: end - lineStarts[endLine], line: endLine + 1 },
+    start: { column: start - lineStarts[startLine], line: startLine + 1 },
   };
 }
 
@@ -241,8 +295,7 @@ export function getLocFor(
   range: TSESTree.Range,
   ast: ts.SourceFile,
 ): TSESTree.SourceLocation {
-  const [start, end] = range.map(pos => getLineAndCharacterFor(pos, ast));
-  return { end, start };
+  return getLocForPositions(range[0], range[1], ast.getLineStarts());
 }
 
 /**
@@ -277,15 +330,6 @@ export function getRange(
   ast: ts.SourceFile,
 ): [number, number] {
   return [node.getStart(ast), node.getEnd()];
-}
-
-/**
- * Returns true if a given ts.Node is a token
- */
-function isToken(node: ts.Node): node is ts.Token<ts.TokenSyntaxKind> {
-  return (
-    node.kind >= SyntaxKind.FirstToken && node.kind <= SyntaxKind.LastToken
-  );
 }
 
 /**
@@ -473,18 +517,32 @@ export function isChildUnwrappableOptionalChain(
 export function getTokenType(
   token: ts.Identifier | ts.Token<ts.SyntaxKind>,
 ): Exclude<AST_TOKEN_TYPES, AST_TOKEN_TYPES.Block | AST_TOKEN_TYPES.Line> {
-  if (token.kind === SyntaxKind.NullKeyword) {
+  return getTokenTypeForKind(token.kind, token.parent);
+}
+
+/**
+ * Returns the type of a token of the given kind with the given parent
+ */
+function getTokenTypeForKind(
+  kind: ts.SyntaxKind,
+  parent: ts.Node,
+): Exclude<AST_TOKEN_TYPES, AST_TOKEN_TYPES.Block | AST_TOKEN_TYPES.Line> {
+  if (
+    kind >= SyntaxKind.FirstPunctuation &&
+    kind <= SyntaxKind.LastPunctuation
+  ) {
+    return AST_TOKEN_TYPES.Punctuator;
+  }
+
+  if (kind === SyntaxKind.NullKeyword) {
     return AST_TOKEN_TYPES.Null;
   }
 
   if (
-    token.kind >= SyntaxKind.FirstKeyword &&
-    token.kind <= SyntaxKind.LastFutureReservedWord
+    kind >= SyntaxKind.FirstKeyword &&
+    kind <= SyntaxKind.LastFutureReservedWord
   ) {
-    if (
-      token.kind === SyntaxKind.FalseKeyword ||
-      token.kind === SyntaxKind.TrueKeyword
-    ) {
+    if (kind === SyntaxKind.FalseKeyword || kind === SyntaxKind.TrueKeyword) {
       return AST_TOKEN_TYPES.Boolean;
     }
 
@@ -492,20 +550,13 @@ export function getTokenType(
   }
 
   if (
-    token.kind >= SyntaxKind.FirstPunctuation &&
-    token.kind <= SyntaxKind.LastPunctuation
-  ) {
-    return AST_TOKEN_TYPES.Punctuator;
-  }
-
-  if (
-    token.kind >= SyntaxKind.NoSubstitutionTemplateLiteral &&
-    token.kind <= SyntaxKind.TemplateTail
+    kind >= SyntaxKind.NoSubstitutionTemplateLiteral &&
+    kind <= SyntaxKind.TemplateTail
   ) {
     return AST_TOKEN_TYPES.Template;
   }
 
-  switch (token.kind) {
+  switch (kind) {
     case SyntaxKind.NumericLiteral:
     case SyntaxKind.BigIntLiteral:
       return AST_TOKEN_TYPES.Numeric;
@@ -520,8 +571,8 @@ export function getTokenType(
       // A TypeScript-StringLiteral token with a TypeScript-JsxAttribute or TypeScript-JsxElement parent,
       // must actually be an ESTree-JSXText token
       if (
-        token.parent.kind === SyntaxKind.JsxAttribute ||
-        token.parent.kind === SyntaxKind.JsxElement
+        parent.kind === SyntaxKind.JsxAttribute ||
+        parent.kind === SyntaxKind.JsxElement
       ) {
         return AST_TOKEN_TYPES.JSXText;
       }
@@ -541,14 +592,14 @@ export function getTokenType(
   }
 
   // Some JSX tokens have to be determined based on their parent
-  if (token.kind === SyntaxKind.Identifier) {
-    if (isJSXToken(token.parent)) {
+  if (kind === SyntaxKind.Identifier) {
+    if (isJSXToken(parent)) {
       return AST_TOKEN_TYPES.JSXIdentifier;
     }
 
     if (
-      token.parent.kind === SyntaxKind.PropertyAccessExpression &&
-      hasJSXAncestor(token)
+      parent.kind === SyntaxKind.PropertyAccessExpression &&
+      hasJSXAncestor(parent)
     ) {
       return AST_TOKEN_TYPES.JSXIdentifier;
     }
@@ -568,11 +619,33 @@ export function convertToken(
     token.kind === SyntaxKind.JsxText
       ? token.getFullStart()
       : token.getStart(ast);
-  const end = token.getEnd();
-  const value = ast.text.slice(start, end);
-  const tokenType = getTokenType(token);
+  return createToken(
+    getTokenType(token),
+    start,
+    token.getEnd(),
+    ast.text,
+    ast.getLineStarts(),
+  );
+}
+
+/**
+ * Creates an ESTree token of the given type for a range of the source text.
+ * @param lineHint a line index to start looking for the token's line from
+ */
+function createToken(
+  tokenType: Exclude<
+    AST_TOKEN_TYPES,
+    AST_TOKEN_TYPES.Block | AST_TOKEN_TYPES.Line
+  >,
+  start: number,
+  end: number,
+  text: string,
+  lineStarts: readonly number[],
+  lineHint?: number,
+): TSESTree.Token {
+  const value = text.slice(start, end);
   const range: TSESTree.Range = [start, end];
-  const loc = getLocFor(range, ast);
+  const loc = getLocForPositions(start, end, lineStarts, lineHint);
 
   if (tokenType === AST_TOKEN_TYPES.RegularExpression) {
     return {
@@ -612,48 +685,359 @@ export function convertToken(
  * @returns the converted Tokens
  */
 export function convertTokens(ast: ts.SourceFile): TSESTree.Token[] {
-  const result: TSESTree.Token[] = [];
-  /**
-   * @param node the ts.Node
-   */
-  function walk(node: ts.Node): void {
-    // TypeScript generates tokens for types in JSDoc blocks. Comment tokens
-    // and their children should not be walked or added to the resulting tokens list.
-    if (isComment(node) || isJSDocComment(node)) {
-      return;
-    }
+  return convertTokensAndComments(ast, true, false).tokens;
+}
 
-    const { kind } = node;
-    if (isToken(node) && kind !== SyntaxKind.EndOfFileToken) {
-      const token = convertToken(node, ast);
+// `import * as ts` reads every member through a getter, so the functions
+// called for every token are read once here.
+const forEachLeadingCommentRange = ts.forEachLeadingCommentRange;
+const forEachTrailingCommentRange = ts.forEachTrailingCommentRange;
+const isJSDocCommentContainingNode = ts.isJSDocCommentContainingNode;
 
-      // TypeScript drops first half of a `<<` in some cases.
-      // Gating on `kind` (a cheap check) keeps the rest of the check,
-      // which has to look at the text, off the hot path.
-      if (kind === SyntaxKind.LessThanToken) {
-        addMissingLessThanToken(result, token, ast);
-      }
+let sharedScanner: ts.Scanner | undefined;
 
-      result.push(token);
-    } else {
-      node.getChildren(ast).forEach(walk);
-    }
-  }
-  walk(ast);
-  return result;
+/**
+ * Returns a scanner over the given text, used to find the tokens that
+ * TypeScript doesn't create nodes for.
+ */
+function getScanner(text: string): ts.Scanner {
+  sharedScanner ??= ts.createScanner(
+    ts.ScriptTarget.Latest,
+    /* skipTrivia */ true,
+  );
+  sharedScanner.setText(text);
+  return sharedScanner;
 }
 
 /**
- * TypeScript recovers the tokens its parser did not keep as children of a node
- * (`<` and `>` of a type argument list, for instance) by re-scanning the source
- * text in the gaps between the children it did keep, and discards any token
- * that runs past the end of the gap being filled.
+ * Moves a scanner to a position. `resetTokenState` replaced `setTextPos` in
+ * TypeScript 5.1.
+ */
+function moveScanner(scanner: ts.Scanner, pos: number): void {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- missing in typescript<5.1
+  if (scanner.resetTokenState) {
+    scanner.resetTokenState(pos);
+  } else {
+    // eslint-disable-next-line @typescript-eslint/no-deprecated -- fallback for typescript<5.1
+    scanner.setTextPos(pos);
+  }
+}
+
+/**
+ * Returns the start of the token a scanner last scanned. `getTokenStart`
+ * replaced `getTokenPos` in TypeScript 5.1.
+ */
+function getScannedTokenStart(scanner: ts.Scanner): number {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- missing in typescript<5.1
+  return scanner.getTokenStart
+    ? scanner.getTokenStart()
+    : // eslint-disable-next-line @typescript-eslint/no-deprecated -- fallback for typescript<5.1
+      scanner.getTokenPos();
+}
+
+/**
+ * Returns the end of the token a scanner last scanned. `getTokenEnd`
+ * replaced `getTextPos` in TypeScript 5.1.
+ */
+function getScannedTokenEnd(scanner: ts.Scanner): number {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- missing in typescript<5.1
+  return scanner.getTokenEnd
+    ? scanner.getTokenEnd()
+    : // eslint-disable-next-line @typescript-eslint/no-deprecated -- fallback for typescript<5.1
+      scanner.getTextPos();
+}
+
+/**
+ * Returns the start of the first token at or after `pos`, skipping trivia.
+ * This is where a token whose full start is `pos` starts.
+ */
+export function getTokenStartAfter(pos: number, ast: ts.SourceFile): number {
+  const scanner = getScanner(ast.text);
+  moveScanner(scanner, pos);
+  scanner.scan();
+  const start = getScannedTokenStart(scanner);
+  scanner.setText(undefined);
+  return start;
+}
+
+/**
+ * Returns the end of the first token at or after `pos`, skipping trivia.
+ */
+export function getTokenEndAfter(pos: number, ast: ts.SourceFile): number {
+  const scanner = getScanner(ast.text);
+  moveScanner(scanner, pos);
+  scanner.scan();
+  const end = getScannedTokenEnd(scanner);
+  scanner.setText(undefined);
+  return end;
+}
+
+/**
+ * Returns false when the text at `pos` certainly doesn't start with trivia
+ * that contains a comment. Only the most common whitespace is skipped;
+ * anything unusual counts as a possible comment, so that TypeScript decides.
+ */
+function mayStartWithComment(text: string, pos: number): boolean {
+  for (; ; pos++) {
+    const ch = text.charCodeAt(pos);
+    // space, line feed, tab, carriage return
+    if (ch === 32 || ch === 10 || ch === 9 || ch === 13) {
+      continue;
+    }
+    // "/", "#" (shebang), vertical tab, form feed, non-ASCII whitespace
+    return ch === 47 || ch === 35 || ch === 11 || ch === 12 || ch > 127;
+  }
+}
+
+function isJsxElementOrFragment(node: ts.Node): boolean {
+  return (
+    node.kind === SyntaxKind.JsxElement || node.kind === SyntaxKind.JsxFragment
+  );
+}
+
+/**
+ * In a JSX file, returns whether a token can be followed by trivia rather
+ * than by JSX text. Does the same check as `iterateComments` in
+ * `ts-api-utils`.
+ */
+function canHaveTrailingTrivia(
+  kind: ts.SyntaxKind,
+  end: number,
+  parent: ts.Node,
+): boolean {
+  switch (kind) {
+    case SyntaxKind.CloseBraceToken:
+      return (
+        parent.kind !== SyntaxKind.JsxExpression ||
+        !isJsxElementOrFragment(parent.parent)
+      );
+    case SyntaxKind.GreaterThanToken:
+      switch (parent.kind) {
+        case SyntaxKind.JsxClosingElement:
+        case SyntaxKind.JsxClosingFragment:
+          return !isJsxElementOrFragment(parent.parent.parent);
+        case SyntaxKind.JsxOpeningElement:
+          return end !== parent.end;
+        case SyntaxKind.JsxOpeningFragment:
+          return false;
+        case SyntaxKind.JsxSelfClosingElement:
+          return end !== parent.end || !isJsxElementOrFragment(parent.parent);
+      }
+  }
+  return true;
+}
+
+/**
+ * Converts the tokens and/or the comments of the given AST in one pass.
+ *
+ * TypeScript only creates nodes for some tokens. `node.getChildren()` fills in
+ * the rest by scanning the text between child nodes, and creates and caches a
+ * node object for each one. This does the same scan, but uses the scanned
+ * positions directly instead of creating nodes.
+ * @param ast the AST object
+ * @param includeTokens whether to convert tokens
+ * @param includeComments whether to convert comments
+ * @returns the converted tokens and comments
+ */
+export function convertTokensAndComments(
+  ast: ts.SourceFile,
+  includeTokens: boolean,
+  includeComments: boolean,
+): { comments: TSESTree.Comment[]; tokens: TSESTree.Token[] } {
+  const tokens: TSESTree.Token[] = [];
+  const comments: TSESTree.Comment[] = [];
+  const text = ast.text;
+  const lineStarts = ast.getLineStarts();
+  const scanner = getScanner(text);
+  const notJsx = ast.languageVariant !== ts.LanguageVariant.JSX;
+  // line of the last converted token; tokens are visited in source order
+  let lineHint = 0;
+  // the node whose children are being visited, and how far into it we are
+  let currentParent: ts.Node = ast;
+  let currentPos = 0;
+  // tokens inside JSDoc comments are only visited to look for comments
+  let emitTokens = includeTokens;
+
+  function addToken(kind: ts.SyntaxKind, token: TSESTree.Token): void {
+    // TypeScript drops first half of a `<<` in some cases.
+    // Gating on `kind` (a cheap check) keeps the rest of the check,
+    // which has to look at the text, off the hot path.
+    if (kind === SyntaxKind.LessThanToken) {
+      addMissingLessThanToken(tokens, token, ast);
+    }
+
+    lineHint = token.loc.start.line - 1;
+    tokens.push(token);
+  }
+
+  function addComment(pos: number, end: number, kind: ts.CommentKind): void {
+    const isLine = kind === SyntaxKind.SingleLineCommentTrivia;
+    comments.push({
+      type: isLine ? AST_TOKEN_TYPES.Line : AST_TOKEN_TYPES.Block,
+      loc: getLocForPositions(pos, end, lineStarts),
+      range: [pos, end],
+      value: text.slice(pos + 2, isLine ? end : end - 2),
+    });
+  }
+
+  /**
+   * Adds the comments before and after a token, like `iterateComments` in
+   * `ts-api-utils` does for each token.
+   */
+  function addCommentsAround(
+    kind: ts.SyntaxKind,
+    pos: number,
+    end: number,
+    parent: ts.Node,
+  ): void {
+    if (pos === end) {
+      return;
+    }
+    if (kind !== SyntaxKind.JsxText && mayStartWithComment(text, pos)) {
+      forEachLeadingCommentRange(
+        text,
+        // skip shebang at position 0
+        pos === 0 ? (ts.getShebang(text) ?? '').length : pos,
+        addComment,
+      );
+    }
+    if (
+      mayStartWithComment(text, end) &&
+      (notJsx || canHaveTrailingTrivia(kind, end, parent))
+    ) {
+      forEachTrailingCommentRange(text, end, addComment);
+    }
+  }
+
+  /**
+   * Visits the tokens between two children of `parent`, which have no nodes.
+   */
+  function visitGap(pos: number, end: number, parent: ts.Node): void {
+    if (pos >= end) {
+      return;
+    }
+    moveScanner(scanner, pos);
+    while (pos < end) {
+      const kind = scanner.scan();
+      const tokenEnd = getScannedTokenEnd(scanner);
+      if (tokenEnd <= end) {
+        if (kind === SyntaxKind.Identifier) {
+          // `getChildren()` fails in the same way
+          throw new Error(
+            `Did not expect ${SyntaxKind[parent.kind]} to have an Identifier in its trivia`,
+          );
+        }
+        if (emitTokens && kind !== SyntaxKind.EndOfFileToken) {
+          addToken(
+            kind,
+            createToken(
+              getTokenTypeForKind(kind, parent),
+              getScannedTokenStart(scanner),
+              tokenEnd,
+              text,
+              lineStarts,
+              lineHint,
+            ),
+          );
+        }
+        if (includeComments) {
+          addCommentsAround(kind, pos, tokenEnd, parent);
+        }
+      }
+      pos = tokenEnd;
+      if (kind === SyntaxKind.EndOfFileToken) {
+        break;
+      }
+    }
+  }
+
+  function visitChild(child: ts.Node): void {
+    const parent = currentParent;
+    visitGap(currentPos, child.pos, parent);
+    walk(child);
+    currentParent = parent;
+    currentPos = child.end;
+  }
+
+  function visitChildren(children: ts.NodeArray<ts.Node>): void {
+    const parent = currentParent;
+    visitGap(currentPos, children.pos, parent);
+    let pos = children.pos;
+    for (const child of children) {
+      visitGap(pos, child.pos, parent);
+      walk(child);
+      pos = child.end;
+    }
+    visitGap(pos, children.end, parent);
+    currentParent = parent;
+    currentPos = children.end;
+  }
+
+  function walk(node: ts.Node): void {
+    const kind = node.kind;
+    if (kind >= SyntaxKind.FirstToken && kind <= SyntaxKind.LastToken) {
+      if (emitTokens && kind !== SyntaxKind.EndOfFileToken) {
+        addToken(
+          kind,
+          createToken(
+            getTokenTypeForKind(kind, node.parent),
+            kind === SyntaxKind.JsxText ? node.pos : node.getStart(ast),
+            node.end,
+            text,
+            lineStarts,
+            lineHint,
+          ),
+        );
+      }
+      if (includeComments) {
+        addCommentsAround(kind, node.pos, node.end, node.parent);
+      }
+      return;
+    }
+
+    if (isJSDocCommentContainingNode(node)) {
+      // these nodes have no tokens between their children
+      node.forEachChild(walk);
+      return;
+    }
+
+    // JSDoc comments come first. TypeScript generates tokens for the types in
+    // them, which should not be added to the resulting tokens list.
+    const jsDoc = (node as { jsDoc?: ts.JSDoc[] } & ts.Node).jsDoc;
+    if (includeComments && jsDoc) {
+      const previousEmitTokens = emitTokens;
+      emitTokens = false;
+      jsDoc.forEach(walk);
+      emitTokens = previousEmitTokens;
+    }
+
+    currentParent = node;
+    currentPos = node.pos;
+    node.forEachChild(visitChild, visitChildren);
+    visitGap(currentPos, node.end, node);
+  }
+
+  try {
+    walk(ast);
+  } finally {
+    scanner.setText(undefined);
+  }
+
+  return { comments, tokens };
+}
+
+/**
+ * The tokens TypeScript's parser did not keep as children of a node (`<` and
+ * `>` of a type argument list, for instance) are recovered by re-scanning the
+ * source text in the gaps between the children it did keep, and any token that
+ * runs past the end of the gap being filled is discarded. `getChildren()` does
+ * this, and `convertTokensAndComments()` does the same.
  *
  * Its scanner produces `<<` as a single token, which the parser splits back
  * apart when the second `<` opens a type parameter list, as in
  * `ReturnType<<T>(x: T) => number>`. The re-scan is not aware of that split,
  * so the `<<` it scans overruns the gap left by the first `<`, and that token
- * is dropped from `getChildren()` entirely.
+ * is dropped entirely.
  *
  * Text skipped in front of a token can otherwise only be trivia, and no trivia
  * can end in a `<`: line comments, shebangs and conflict markers all run to the

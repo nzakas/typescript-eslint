@@ -5,8 +5,7 @@ import type { ParseSettings } from './parseSettings';
 import type { TSESTree } from './ts-estree';
 
 import { Converter, convertError } from './convert';
-import { convertComments } from './convert-comments';
-import { convertTokens } from './node-utils';
+import { convertTokensAndComments } from './node-utils';
 import { simpleTraverse } from './simple-traverse';
 
 export function astConverter(
@@ -57,17 +56,20 @@ export function astConverter(
   }
 
   /**
-   * Optionally convert and include all tokens in the AST
+   * Optionally convert and include all tokens and comments in the AST
    */
-  if (parseSettings.tokens) {
-    estree.tokens = convertTokens(ast);
-  }
-
-  /**
-   * Optionally convert and include all comments in the AST
-   */
-  if (parseSettings.comment) {
-    estree.comments = convertComments(ast);
+  if (parseSettings.tokens || parseSettings.comment) {
+    const { comments, tokens } = convertTokensAndComments(
+      ast,
+      !!parseSettings.tokens,
+      parseSettings.comment,
+    );
+    if (parseSettings.tokens) {
+      estree.tokens = tokens;
+    }
+    if (parseSettings.comment) {
+      estree.comments = comments;
+    }
   }
 
   const astMaps = instance.getASTMaps();

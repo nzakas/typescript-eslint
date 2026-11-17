@@ -9,6 +9,9 @@ import {
   isThisIdentifier,
   createError,
 } from './node-utils';
+import { typescriptVersionIsAtLeast } from './version-check';
+
+const isAtLeast50 = typescriptVersionIsAtLeast['5.0'];
 
 const SyntaxKind = ts.SyntaxKind;
 
@@ -131,8 +134,13 @@ function nodeHasIllegalDecorators(
 }
 
 export function checkModifiers(node: ts.Node): void {
-  // typescript<5.0.0
-  if (nodeHasIllegalDecorators(node)) {
+  if (isAtLeast50) {
+    // Decorators are stored with the modifiers, so a node without modifiers
+    // has nothing to check.
+    if ((node as Partial<ts.HasModifiers>).modifiers == null) {
+      return;
+    }
+  } else if (nodeHasIllegalDecorators(node)) {
     throw createError(
       node.illegalDecorators[0],
       'Decorators are not valid here.',

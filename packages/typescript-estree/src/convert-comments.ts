@@ -1,10 +1,8 @@
-import * as tsutils from 'ts-api-utils';
-import * as ts from 'typescript';
+import type * as ts from 'typescript';
 
 import type { TSESTree } from './ts-estree';
 
-import { getLocFor } from './node-utils';
-import { AST_TOKEN_TYPES } from './ts-estree';
+import { convertTokensAndComments } from './node-utils';
 
 /**
  * Convert all comments for the given AST.
@@ -13,22 +11,5 @@ import { AST_TOKEN_TYPES } from './ts-estree';
  * @private
  */
 export function convertComments(ast: ts.SourceFile): TSESTree.Comment[] {
-  return Array.from(
-    tsutils.iterateComments(ast),
-    ({ end, kind, pos, value }) => {
-      const type =
-        kind === ts.SyntaxKind.SingleLineCommentTrivia
-          ? AST_TOKEN_TYPES.Line
-          : AST_TOKEN_TYPES.Block;
-      const range: TSESTree.Range = [pos, end];
-      const loc = getLocFor(range, ast);
-
-      return {
-        type,
-        loc,
-        range,
-        value,
-      };
-    },
-  );
+  return convertTokensAndComments(ast, false, true).comments;
 }
